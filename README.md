@@ -214,7 +214,7 @@ MIT License – feel free to use, modify, and distribute.
 ---
 
 ## 📞 Support & Contact
-For bugs, feature requests, or questions, open an issue on GitHub or contact the author at `sj@example.com`.
+For bugs, feature requests, or questions, open an issue on GitHub or contact the author at `rafaymuhammad901@gmail.com`.
 
 ---
 
