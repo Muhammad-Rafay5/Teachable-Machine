@@ -38,7 +38,8 @@ from pathlib import Path
 import torch
 import torchvision.transforms as transforms
 from torchvision import models
-from PIL import Image
+from PIL import Image, ImageOps
+from typing import Tuple, cast
 
 from sklearn.svm import SVC
 from sklearn.preprocessing import LabelEncoder, normalize
@@ -55,7 +56,7 @@ log = logging.getLogger(__name__)
 # Loading it per-request would add ~2 seconds to every call.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_extractor() -> torch.nn.Module:
+def build_extractor() -> Tuple[torch.nn.Module, torch.device]:
     """
     Load MobileNetV3-Large pretrained on ImageNet, strip the classifier head.
 
@@ -172,7 +173,8 @@ def extract_features(img: Image.Image) -> np.ndarray:
         we compare "which direction" they point in 960-dim space.
     """
     # Apply preprocessing: PIL Image → normalized tensor of shape (3, 224, 224)
-    tensor = TRANSFORM(img).unsqueeze(0).to(DEVICE)
+    # TRANSFORM(img) returns a torch.Tensor; silence type-checkers about PIL vs Tensor
+    tensor = TRANSFORM(img).unsqueeze(0).to(DEVICE)  # type: ignore
     #   unsqueeze(0) adds a batch dimension: (3, 224, 224) → (1, 3, 224, 224)
     #   the model always expects (batch_size, channels, height, width)
 
@@ -187,6 +189,64 @@ def extract_features(img: Image.Image) -> np.ndarray:
     features_normalized = normalize(features_np, norm="l2")   # shape: (1, 960)
 
     return features_normalized[0]   # return shape: (960,)
+
+
+def augment_image(img: Image.Image, n_variants: int = 0) -> list:
+    """Return a list of PIL Image variants including the original.
+
+    n_variants controls how many additional augmented variants to include
+    (simple, deterministic augmentations: horizontal flip and small rotations).
+    """
+    variants = [img]
+    if n_variants <= 0:
+        return variants
+
+    # Build candidate augmentations in deterministic order
+    candidates = []
+    # horizontal flip
+    try:
+        candidates.append(ImageOps.mirror(img))
+    except Exception:
+        pass
+
+    # small rotations
+    deg = getattr(settings, "AUGMENT_ROTATION_DEGREES", 15)
+    try:
+        candidates.append(img.rotate(deg))
+    except Exception:
+        pass
+    try:
+        candidates.append(img.rotate(-deg))
+    except Exception:
+        pass
+
+    # Stronger augmentations
+    if getattr(settings, "AUGMENT_COLOR_JITTER", False):
+        try:
+            b, c, s, h = getattr(settings, "COLOR_JITTER_PARAMS", (0.2, 0.2, 0.2, 0.05))
+            jitter = transforms.ColorJitter(brightness=b, contrast=c, saturation=s, hue=h)
+            candidates.append(jitter(img))
+        except Exception:
+            pass
+
+    if getattr(settings, "AUGMENT_RANDOM_CROP", False):
+        try:
+            scale = getattr(settings, "RANDOM_CROP_SCALE", (0.8, 1.0))
+            # RandomResizedCrop expects size; use IMAGE_SIZE from config
+            size = settings.IMAGE_SIZE[0]
+            rrc = transforms.RandomResizedCrop(size, scale=scale)
+            candidates.append(rrc(img))
+        except Exception:
+            pass
+
+    # Take up to n_variants candidates in order
+    take = max(0, n_variants)
+    for c in candidates[:take]:
+        variants.append(c)
+
+    # Ensure all are RGB
+    variants = [v.convert("RGB") for v in variants]
+    return variants
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -214,8 +274,10 @@ def train_model() -> dict:
     dataset_dir = settings.DATASET_DIR
 
     # ── Step 1: Collect all image paths with their class labels ──────────────
-    X_raw = []   # will become list of (960,) numpy arrays
-    y_raw = []   # will become list of class name strings
+    X_raw = []   # augmented features list
+    y_raw = []   # augmented labels
+    X_raw_base = []  # features from original images only (for CV)
+    y_raw_base = []
     samples_per_class = {}
 
     class_folders = sorted([
@@ -236,9 +298,18 @@ def train_model() -> dict:
         for img_path in image_paths:
             try:
                 img = Image.open(img_path).convert("RGB")
-                feat = extract_features(img)   # shape: (960,)
-                X_raw.append(feat)
-                y_raw.append(class_dir.name)
+                # Always extract features from the original image for reliable CV
+                base_feat = extract_features(img)
+                X_raw_base.append(base_feat)
+                y_raw_base.append(class_dir.name)
+
+                # Create augmentations for final training set
+                aug_count = getattr(settings, "TRAIN_AUGMENTATIONS", 0)
+                variants = augment_image(img, aug_count)
+                for var in variants:
+                    feat = extract_features(var)   # shape: (960,)
+                    X_raw.append(feat)
+                    y_raw.append(class_dir.name)
             except Exception as e:
                 log.warning(f"  Skipping {img_path.name}: {e}")
 
@@ -273,7 +344,8 @@ def train_model() -> dict:
     clf = SVC(
         kernel="rbf",              # non-linear boundary
         C=settings.SVM_C,         # 10.0 — regularization strength
-        gamma=settings.SVM_GAMMA, # "scale" — auto-calibrated to data
+        # settings.SVM_GAMMA may be a str ('scale'|'auto') or float — silence type check
+        gamma=settings.SVM_GAMMA, # type: ignore
         probability=True,          # enables predict_proba()
         class_weight="balanced",   # handles unequal class sizes
         random_state=42,           # reproducible results
@@ -284,18 +356,26 @@ def train_model() -> dict:
     # repeats N times. Gives an honest estimate of real-world accuracy
     # without needing a separate test set.
     #
-    # We only do this if there's enough data (≥5 images per class minimum).
+    # We only do cross-validation if there's enough base (non-augmented) samples.
     cv_accuracy = None
     min_count = min(samples_per_class.values())
 
-    if min_count >= 5 and len(X) >= len(le.classes_) * 5:
-        n_splits = min(5, min_count)   # can't have more folds than samples
-        cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-        # StratifiedKFold preserves class ratio in each fold (important for imbalanced data)
+    # Build base arrays only if we actually collected base features
+    if X_raw_base and y_raw_base:
+        X_base = np.array(X_raw_base)
+        y_base = np.array(y_raw_base)
+    else:
+        X_base = None
+        y_base = None
 
-        scores = cross_val_score(clf, X, y_encoded, cv=cv, scoring="accuracy")
+    if X_base is not None and min_count >= 5 and len(X_base) >= len(le.classes_) * 5:
+        n_splits = min(5, min_count)
+        cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        # y_base is guaranteed non-None here
+        y_base_encoded = LabelEncoder().fit_transform(cast(np.ndarray, y_base))
+        scores = cross_val_score(clf, X_base, y_base_encoded, cv=cv, scoring="accuracy")
         cv_accuracy = float(scores.mean())
-        log.info(f"Cross-val accuracy: {cv_accuracy:.2%} ± {scores.std():.2%}")
+        log.info(f"Cross-val accuracy (on original images): {cv_accuracy:.2%} ± {scores.std():.2%}")
 
     # Now train on the FULL dataset (cross-val was just for the accuracy estimate)
     clf.fit(X, y_encoded)
@@ -323,6 +403,46 @@ def train_model() -> dict:
         result["cv_accuracy"] = f"{cv_accuracy:.2%}"
 
     return result
+
+
+def hyperparameter_search(max_candidates: int = 20) -> dict:
+    """Run a small grid search over SVM hyperparameters and return best params.
+
+    This is provided as a helper — it is NOT run automatically by `train_model()`.
+    Running this may be slow depending on dataset size.
+    """
+    from sklearn.model_selection import GridSearchCV
+
+    dataset_dir = settings.DATASET_DIR
+    X_raw = []
+    y_raw = []
+
+    for class_dir in sorted([d for d in dataset_dir.iterdir() if d.is_dir()]):
+        for img_path in [p for p in class_dir.iterdir() if p.suffix.lower() in settings.ALLOWED_EXTENSIONS]:
+            try:
+                img = Image.open(img_path).convert("RGB")
+                feat = extract_features(img)
+                X_raw.append(feat)
+                y_raw.append(class_dir.name)
+            except Exception as e:
+                log.warning(f"Skipping {img_path.name} during hyperparam search: {e}")
+
+    if not X_raw:
+        raise RuntimeError("No images found for hyperparameter search.")
+
+    X = np.array(X_raw)
+    y = LabelEncoder().fit_transform(np.array(y_raw))
+
+    param_grid = {
+        "C": [1.0, 10.0],
+        "gamma": ["scale", "auto"],
+    }
+
+    base = SVC(kernel="rbf", probability=True, class_weight="balanced", random_state=42)
+    gs = GridSearchCV(base, param_grid, cv=3, scoring="accuracy", n_jobs=1)
+    gs.fit(X, y)
+
+    return {"best_params": gs.best_params_, "best_score": float(gs.best_score_)}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -371,13 +491,22 @@ def predict_image(image_bytes: bytes) -> dict:
     except Exception:
         raise ValueError("Could not read the uploaded image. Try a different file.")
 
-    # ── Extract features ──────────────────────────────────────────────────────
-    features = extract_features(img)           # shape: (960,)
-    features_2d = features.reshape(1, -1)      # shape: (1, 960) — SVM expects 2D
+    # ── Extract features with optional Test-Time Augmentation (TTA) ──────────
+    probs_list = []
+    if getattr(settings, "TTA_ENABLED", True):
+        tta_variants = max(1, getattr(settings, "TTA_VARIANTS", 2))
+        # augment_image expects number of additional variants, so pass tta_variants-1
+        variants = augment_image(img, max(0, tta_variants - 1))
+    else:
+        variants = [img]
 
-    # ── Get class probabilities ───────────────────────────────────────────────
-    # probs shape: (1, n_classes) — one probability per class
-    probs = clf.predict_proba(features_2d)[0]  # shape: (n_classes,)
+    for var in variants:
+        features = extract_features(var)           # shape: (960,)
+        features_2d = features.reshape(1, -1)      # shape: (1, 960)
+        probs_list.append(clf.predict_proba(features_2d)[0])
+
+    # Average probabilities across variants
+    probs = np.mean(probs_list, axis=0)
 
     # Index of the class with the highest probability
     best_idx    = int(np.argmax(probs))

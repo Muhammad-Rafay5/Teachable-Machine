@@ -52,6 +52,26 @@ class Settings:
     # ── Allowed Image Extensions ───────────────────────────────────────────────
     ALLOWED_EXTENSIONS: set = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
+    # ── Data Augmentation / Test-Time Augmentation (TTA) ──────────────────────
+    # Number of augmented variants to generate per image during training.
+    # 0 = no augmentation, 1 = include one simple augmentation (flip), etc.
+    TRAIN_AUGMENTATIONS: int = 4
+
+    # Enable Test-Time Augmentation for prediction (averages probabilities).
+    TTA_ENABLED: bool = True
+    # Number of variants to use at prediction time (including original).
+    TTA_VARIANTS: int = 4
+
+    # Rotation degrees used for simple augmentation (± degrees)
+    AUGMENT_ROTATION_DEGREES: int = 15
+    # Stronger augmentation toggles
+    AUGMENT_COLOR_JITTER: bool = True
+    AUGMENT_RANDOM_CROP: bool = True
+    # Color jitter params: brightness, contrast, saturation, hue
+    COLOR_JITTER_PARAMS: tuple = (0.2, 0.2, 0.2, 0.05)
+    # RandomResizedCrop scale range
+    RANDOM_CROP_SCALE: tuple = (0.8, 1.0)
+
 
 # Single shared instance — import this everywhere
 settings = Settings()

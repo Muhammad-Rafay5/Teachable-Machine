@@ -115,18 +115,40 @@ def delete_backend_class_folder(class_name: str):
 # ── HTTP API Helper ────────────────────────────────────────────────────────────
 def call_api(method: str, path: str, **kwargs) -> tuple:
     """Generic HTTP helper. Returns (response_dict, status_code)."""
+    # Simple retry loop to handle transient multipart upload issues
+    last_exc = None
+    last_response = None
+    for attempt in range(2):
+        try:
+            # Ensure kwargs is fresh per-attempt (requests may consume file-like objects)
+            r = requests.request(method, f"{API}{path}", **kwargs)
+            last_response = r
+            break
+        except requests.exceptions.ConnectionError:
+            st.error(
+                "Cannot connect to backend. "
+                "Make sure you ran: cd backend && uvicorn app.main:app --reload"
+            )
+            return None, 0
+        except Exception as e:
+            last_exc = e
+            # retry once on unexpected errors (e.g., multipart encoding hiccup)
+            if attempt == 0:
+                continue
+            st.error(f"Unexpected error: {e}")
+            return None, 0
+
+    if last_response is None:
+        if last_exc:
+            st.error(f"Unexpected error: {last_exc}")
+        return None, 0
+
     try:
-        r = requests.request(method, f"{API}{path}", **kwargs)
-        return r.json(), r.status_code
-    except requests.exceptions.ConnectionError:
-        st.error(
-            "Cannot connect to backend. "
-            "Make sure you ran: cd backend && uvicorn app.main:app --reload"
-        )
-        return None, 0
-    except Exception as e:
-        st.error(f"Unexpected error: {e}")
-        return None, 0
+        payload = last_response.json()
+    except ValueError:
+        payload = {"detail": last_response.text or f"HTTP {last_response.status_code}"}
+
+    return payload, last_response.status_code
 
 def refresh_classes():
     """Pull current class names and counts from the backend and merge with local state."""
@@ -303,7 +325,7 @@ with col_classes:
                     if st.button(f"Add {len(uploaded_files)} images to '{cls_name}'", key=f"save_btn_{idx}", type="primary", use_container_width=True):
                         with st.spinner("Uploading images..."):
                             files_payload = [
-                                ("files", (f.name, f.getvalue(), f.type))
+                                ("files", (f.name, io.BytesIO(f.getvalue()), f.type))
                                 for f in uploaded_files
                             ]
                             data, status = call_api(
@@ -327,7 +349,7 @@ with col_classes:
                             data, status = call_api(
                                 "POST", "/upload-sample",
                                 data={"class_name": cls_name},
-                                files=[("files", ("webcam.jpg", cam_frame.getvalue(), "image/jpeg"))],
+                                files=[("files", ("webcam.jpg", io.BytesIO(cam_frame.getvalue()), "image/jpeg"))],
                                 timeout=15,
                             )
                         if status == 200:
@@ -398,7 +420,13 @@ with col_training:
             tr = st.session_state.train_result
             st.divider()
             st.markdown("##### 📊 Last Training Session:")
-            st.metric(label="Total Images", value=tr.get("total_samples", 0))
+            # Show the number of images the user actually uploaded (tracked in session state)
+            uploaded_total = int(sum(st.session_state.counts.values())) if st.session_state.counts else 0
+            st.metric(label="Total Uploaded Images", value=uploaded_total)
+            # Backend `total_samples` may include augmented variants; show it only as a detail
+            backend_total = tr.get("total_samples", None)
+            if backend_total is not None and backend_total != uploaded_total:
+                st.caption(f"(Backend used {backend_total} samples including augmentations)")
             if "cv_accuracy" in tr:
                 st.metric(label="Cross-Val Accuracy", value=tr["cv_accuracy"])
             else:

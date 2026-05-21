@@ -43,6 +43,8 @@ def sanitize_class_name(name: str) -> str:
     """
     safe = "".join(c for c in name.strip() if c.isalnum() or c in " -_")
     safe = safe.strip()
+    # Normalize to Title Case for consistent class labels (e.g., 'cat' -> 'Cat')
+    safe = safe.title()
     if not safe:
         raise ValueError(f"Class name '{name}' is invalid or empty after sanitization.")
     return safe
