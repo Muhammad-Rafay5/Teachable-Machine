@@ -56,7 +56,8 @@ app = FastAPI(
 # (running on port 8000). Without this, browsers block cross-origin requests.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # in production, replace "*" with your frontend URL
+    allow_origins=["*"],
+    allow_credentials=True,# in production, replace "*" with your frontend URL
     allow_methods=["*"],
     allow_headers=["*"],
 )
